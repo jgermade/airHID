@@ -1,0 +1,17 @@
+menu "airHID captura USB"
+
+    config AIRHID_DUMP_REPORT_DESCRIPTOR
+        bool "Volcar el report descriptor de cada interfaz al conectar"
+        default y
+        help
+            Necesario para saber cómo interpretar reportes no-boot
+            (NKRO del teclado, ratón del dongle Bolt...).
+
+    config AIRHID_FORCE_BOOT_PROTOCOL
+        bool "Forzar boot protocol en interfaces que lo soporten"
+        default n
+        help
+            Teclado: reporte fijo de 8 bytes (6KRO). Ratón: 3-4 bytes.
+            Desactivado para ver los reportes reales del dispositivo.
+
+endmenu
