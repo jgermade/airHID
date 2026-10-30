@@ -137,7 +137,8 @@ Consecuencias:
 
 | Pieza | Lenguaje / stack | Motivo |
 |---|---|---|
-| Núcleo común (protocolo, HMAC, slots, remapeo, modelo de gamepad) | Rust `no_std` | Testeable en PC, compartido con [anygamepad](https://github.com/anygamepad/anygamepad.github.io) |
+| Núcleo común (protocolo, HMAC, slots, formato compacto de gamepad) | Rust `no_std` | Testeable en PC; enlazable desde C (espnow-retro) |
+| Mandos: descriptores HID, perfiles, mapeo al modelo canónico | Rust `std`: crates de [anygamepad](https://github.com/anygamepad/anygamepad.github.io) | Mismo autor; se usan tal cual en las apps `std` |
 | km-client, gamepad-client, dongle-server | Rust `std` sobre ESP-IDF (`esp-idf-svc`) | Un solo toolchain, ESP-NOW y NVS desde `esp-idf-svc`, BLE con NimBLE |
 | USB Host y USB Device | Componentes C sobre ESP-IDF + wrappers Rust | El USB Host en Rust puro no está maduro; ver [Wrappers Rust](#wrappers-rust) |
 | espnow-retro | C (fork BlueRetro) + núcleo vía C ABI | Reutiliza drivers de consola probados |
@@ -150,6 +151,8 @@ Notas:
 - Se descarta por ahora `esp-hal` (`no_std` bare-metal) para las apps: tendría
   sentido en el dongle-server (no necesita USB Host), pero obligaría a mantener
   dos stacks de radio y BLE. El núcleo `no_std` deja la puerta abierta.
+- El ESP32-S3 y el ESP32 original tienen FPU de precisión simple: los `f32`
+  del modelo de anygamepad no son un problema de rendimiento.
 
 ### Estructura del repositorio
 
@@ -157,6 +160,7 @@ Notas:
 crates/                       Rust
   airhid-core                 no_std: paquetes, HMAC, anti-replay, slots, remapeo, gamepad
   airhid-core-ffi             C ABI del núcleo (cbindgen) para espnow-retro
+  airhid-gamepad              mando USB → modelo canónico (anygamepad) → formato compacto
   airhid-usb-host             wrapper seguro sobre components/airhid_usb_host
   airhid-usb-device           wrapper seguro sobre components/airhid_usb_device
   airhid-air                  enlace ESP-NOW (esp-idf-svc)
@@ -177,32 +181,52 @@ docs/
 Dependencias:
 
 ```
-airhid-core        → anygamepad-model (núcleo no_std, ver abajo)
+airhid-core        → (sin dependencias: no_std)
+airhid-gamepad     → airhid-core, anygamepad-hid, anygamepad-db, anygamepad
 airhid-usb-host    → airhid-core, components/airhid_usb_host
 airhid-usb-device  → airhid-core, components/airhid_usb_device
 airhid-air         → airhid-core
 airhid-ble         → airhid-core
 km-client          → usb-host, air, ble
-gamepad-client     → usb-host, air, ble
+gamepad-client     → usb-host, gamepad, air, ble
 dongle-server      → usb-device, air, ble
 espnow-retro       → airhid-core-ffi
 ```
 
 ### Relación con anygamepad
 
-anygamepad (mismo autor) define un modelo canónico de gamepad y un formato de
-perfiles por dispositivo. airHID lo usa en dos pasos:
+anygamepad (mismo autor) normaliza la entrada de cualquier mando a un modelo
+canónico, con perfiles por dispositivo. Como las apps de airHID son Rust
+`std` sobre ESP-IDF, sus crates se usan **directamente**, sin generar código
+intermedio:
 
-1. **Corto plazo:** anygamepad genera código C/Rust para airHID: modelo
-   compacto (máscara de bits, ejes `int8`/`uint8`) y tablas de perfiles por
-   VID/PID. Los perfiles se escriben con fuentes `RawSource::Hid { page,
-   usage }`, que es lo que ve un USB Host.
-2. **Objetivo:** núcleo `no_std` sin `alloc` en `anygamepad-model` (tipos de
-   punto fijo, decodificadores sobre `&[u8]`) usado directamente por
-   `airhid-core`.
+| Crate | Uso en airHID |
+|---|---|
+| `anygamepad-hid` | Parsea el report descriptor de cada interfaz USB y lee sus reportes como elementos crudos por usage HID (`RawSource::Hid`) |
+| `anygamepad-db` | Perfiles TOML por dispositivo (embebidos + overrides de usuario en NVS) |
+| `anygamepad` (`mapping`) | `Mapper`: elementos crudos + perfil → `GamepadState` |
+| `anygamepad` (`protocol`) | Decodificadores específicos (DualShock 4, DualSense) cuando el descriptor no basta |
+
+```
+reporte USB ─▶ RawReader (anygamepad-hid) ─▶ RawState ─▶ Mapper + perfil ─▶ GamepadState
+                                                                             │
+                                                     airhid-gamepad: a formato compacto
+                                                                             ▼
+                                                                 airhid_gamepad_t ─ESP-NOW─▶
+```
+
+- anygamepad trabaja **en los extremos**; por la radio viaja el formato
+  compacto de 10 bytes ([Modelo de gamepad](#modelo-de-gamepad)), no
+  `GamepadState` (ejes `f32`, IMU, touch).
+- En firmware: sin la feature `embedded-sdl` (sus mapeos usan índices del
+  SO, no usages HID) y sin reservas de memoria en el camino de cada reporte
+  (`RawReader::read` y `Mapper::apply` no reservan).
+- espnow-retro (C) no usa anygamepad: solo el formato compacto vía
+  `airhid-core-ffi`.
 
 airHID aporta a anygamepad un backend nuevo (reporte HID en bruto vía USB
-Host) y capturas reales de dispositivos (fase 1) para validar decodificadores.
+Host) y capturas reales de dispositivos (fase 1) para validar el parser y
+los decodificadores.
 
 ---
 
@@ -396,17 +420,14 @@ Dos etapas separadas:
 2. **Modelo → destino** (HID gamepad del PC o consola concreta): mapa fijo por
    destino, configurable solo en casos especiales.
 
-Formato fuente: perfiles TOML de anygamepad (`b0`, `+a1`, `a1~`, `h0.1`,
-fuentes HID por usage). Se compilan a tablas en build. Regla compilada:
+La etapa 1 es la de anygamepad: perfiles TOML (`b{hid:0x0009:0x0001}`,
+`+a{hid:0x0001:0x0030}`, `a{...}~`, `h0.1`, zonas muertas) aplicados por su
+`Mapper`. Los perfiles de usuario se guardan en NVS como TOML y se cargan
+como overrides (`Database::load_override_toml`).
 
-```c
-typedef struct {
-    uint8_t n_src, n_dst;        // número de entradas válidas (sin centinela ambiguo)
-    uint8_t src[4];
-    uint8_t dst[4];
-    int8_t  threshold;           // para ejes usados como botón
-} airhid_remap_rule_t;
-```
+La etapa 2 es de airHID: del modelo canónico al formato compacto, y de ahí
+al descriptor HID del dongle-server o al protocolo de consola de
+espnow-retro (mapas de BlueRetro).
 
 ---
 
@@ -657,12 +678,14 @@ Estimaciones a validar con la radio siempre activa (`WIFI_PS_NONE`).
 
 Spikes que pueden adelantarse:
 
-- **R1** — anygamepad: generación de modelo compacto y tablas de perfiles
-  para airHID.
+- **R1** — anygamepad: parser de report descriptor y lector de reportes
+  (`anygamepad-hid`). Hecho en la rama `claude/friendly-mayer-o0yq7v` de
+  anygamepad; falta validarlo con los descriptores reales de la fase 1.
 - **R2** — Coexistencia BT Classic + ESP-NOW en ESP32 original: latencia y
   jitter de ambos con tráfico simultáneo.
 - **R3** — Toolchain Rust Xtensa + `esp-idf-sys` con un componente C propio
-  (`extra_components`) compilando en CI.
+  (`extra_components`) compilando en CI, y los crates de anygamepad
+  (edition 2024, Rust ≥ 1.85) compilando para `xtensa-esp32s3-espidf`.
 
 ## Riesgos
 
@@ -672,6 +695,7 @@ Spikes que pueden adelantarse:
 | Coexistencia BT + ESP-NOW | Latencia en espnow-retro | Spike R2; plan B de dos chips |
 | Seguridad del pairing | Keylogger / inyección | LE Secure Connections + HKDF; revisión antes de fase 4 |
 | Toolchain Rust Xtensa | Fricción de build | Spike R3; las piezas críticas de hardware siguen en C |
+| anygamepad en firmware (tamaño, reservas, `f32`) | Latencia o flash | Medir en R3; sin `embedded-sdl` |
 | Arquitectura de BlueRetro poco extensible | Más trabajo en fase 6 | Revisar el código antes de comprometer la fase |
 
 ---
@@ -693,8 +717,8 @@ Spikes que pueden adelantarse:
 ## Proyectos relacionados
 
 - **[anygamepad](https://github.com/anygamepad/anygamepad.github.io)** — modelo
-  canónico de gamepad, perfiles por dispositivo y tester web. Fuente del
-  modelo y del formato de perfiles de airHID.
+  canónico de gamepad, parser HID, perfiles por dispositivo, motor de mapeo
+  y tester web. Dependencia directa de los clientes de airHID.
 - **[BlueRetro](https://github.com/darthcloud/BlueRetro)** — mandos Bluetooth
   a consolas retro. Base de espnow-retro.
 - **SDL GameControllerDB** — mapeos de mandos, importados por anygamepad.
@@ -713,4 +737,4 @@ Spikes que pueden adelantarse:
 6. ¿Cuántos mandos por gamepad-client? ¿Rumble en v1?
 7. ¿Cómo se configura el remapeo: BLE desde móvil, web o pantalla?
 8. BlueRetro: licencia actual y facilidad para añadir una fuente ESP-NOW.
-9. Ubicación de la generación de código de perfiles: anygamepad o airHID.
+9. ¿Cómo se versiona la dependencia de anygamepad desde airHID (git con revisión fijada, crates.io cuando publique)?
