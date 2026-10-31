@@ -1,0 +1,16 @@
+name: build
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  usb-capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: espressif/esp-idf-ci-action@v1
+        with:
+          esp_idf_version: v5.5.6
+          target: esp32s3
+          path: experiments/01-usb-capture
